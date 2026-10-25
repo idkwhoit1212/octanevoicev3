@@ -172,6 +172,9 @@
             text-align: left;
             word-break: break-all;
         }
+        #audioContainer {
+            display: none;
+        }
     </style>
     <script src="https://cdn.jsdelivr.net/npm/livekit-client/dist/livekit-client.umd.min.js"></script>
 </head>
@@ -227,6 +230,8 @@
     </div>
 </div>
 
+<div id="audioContainer"></div>
+
 <script>
     const LIVEKIT_URL = "wss://octanevc-tzsmlvtk.livekit.cloud";
     const API_KEY = "APIznX5jQRcqBmK";
@@ -251,6 +256,7 @@
     const peersList = document.getElementById('peersList');
     const statusLabel = document.getElementById('statusLabel');
     const errorNotice = document.getElementById('errorNotice');
+    const audioContainer = document.getElementById('audioContainer');
 
     function showError(msg) {
         errorNotice.innerText = msg;
@@ -268,6 +274,7 @@
     connectBtn.addEventListener('click', startConnection);
     muteBtn.addEventListener('click', toggleMute);
 
+    // Подпись JWT токена с полными правами canPublish, canSubscribe, canPublishData
     async function signJwtWebCrypto(apiKey, apiSecret, roomName, identity) {
         const header = { alg: "HS256", typ: "JWT" };
         const now = Math.floor(Date.now() / 1000);
@@ -281,7 +288,7 @@
                 room: roomName,
                 roomJoin: true,
                 canPublish: true,
-                canSubscribe: true,
+                canSubscribe: true,      // КРИТИЧЕСКИ ВАЖНО для приема звука!
                 canPublishData: true
             }
         };
@@ -341,7 +348,7 @@
                 await audioCtx.resume();
             }
 
-            console.log("[Voice] Signing token for:", username);
+            console.log("[Voice] Signing token with canSubscribe=true for:", username);
             const token = await signJwtWebCrypto(API_KEY, API_SECRET, roomName, username);
 
             currentRoom = new LivekitClient.Room({
@@ -354,7 +361,9 @@
                 }
             });
 
+            // Когда подписались на аудио другого игрока
             currentRoom.on(LivekitClient.RoomEvent.TrackSubscribed, (track, pub, participant) => {
+                console.log("[Voice] TrackSubscribed from:", participant.identity, "kind:", track.kind);
                 if (track.kind === LivekitClient.Track.Kind.Audio) {
                     setupRemote3DAudio(participant, track);
                 }
@@ -369,11 +378,12 @@
                 updatePeerListUI();
             });
 
-            currentRoom.on(LivekitClient.RoomEvent.ParticipantConnected, () => {
+            currentRoom.on(LivekitClient.RoomEvent.ParticipantConnected, (participant) => {
+                console.log("[Voice] New peer connected:", participant.identity);
                 updatePeerListUI();
             });
 
-            // ПРИЕМ КООРДИНАТ ИЗ ROBLOX ЧЕРЕЗ DATA CHANNEL LIVEKIT
+            // Прием координат из Roblox через Data Channel
             currentRoom.on(LivekitClient.RoomEvent.DataReceived, (payload) => {
                 try {
                     const text = new TextDecoder().decode(payload);
@@ -382,7 +392,6 @@
                         update3DPositions(data.positions, username);
                     }
                 } catch (e) {
-                    // Если данные пришли в base64
                     try {
                         const raw = atob(new TextDecoder().decode(payload));
                         const data = JSON.parse(raw);
@@ -416,17 +425,36 @@
 
     function setupRemote3DAudio(participant, track) {
         if (!audioCtx) return;
+
+        // Создаем и прикрепляем HTML Audio Element (гарантирует разблокировку звука в браузере)
+        const audioElement = track.attach();
+        audioElement.autoplay = true;
+        audioElement.volume = 1.0;
+        audioContainer.appendChild(audioElement);
+
+        // Также связываем с Web Audio 3D Panner
         const stream = new MediaStream([track.mediaStreamTrack]);
         const sourceNode = audioCtx.createMediaStreamSource(stream);
 
         const panner = audioCtx.createPanner();
         panner.panningModel = 'HRTF';
         panner.distanceModel = 'inverse';
-        panner.refDistance = 10;
-        panner.maxDistance = 120;
-        panner.rolloffFactor = 1.3;
+        panner.refDistance = 12;
+        panner.maxDistance = 140;
+        panner.rolloffFactor = 1.2;
+
+        // По умолчанию ставим рядом, чтобы было слышно сразу
+        if (panner.positionX) {
+            panner.positionX.setValueAtTime(0, audioCtx.currentTime);
+            panner.positionY.setValueAtTime(0, audioCtx.currentTime);
+            panner.positionZ.setValueAtTime(0, audioCtx.currentTime);
+        } else {
+            panner.setPosition(0, 0, 0);
+        }
 
         const gainNode = audioCtx.createGain();
+        gainNode.gain.value = 1.0;
+
         sourceNode.connect(panner);
         panner.connect(gainNode);
         gainNode.connect(audioCtx.destination);
@@ -435,27 +463,28 @@
             panner,
             gainNode,
             sourceNode,
+            element: audioElement,
             name: participant.name || participant.identity
         });
 
+        console.log("[Voice] Audio routing fully configured for:", participant.identity);
         updatePeerListUI();
     }
 
     function removeRemoteAudio(identity) {
         const node = audioNodes.get(identity);
         if (node) {
-            node.sourceNode.disconnect();
-            node.panner.disconnect();
-            node.gainNode.disconnect();
+            if (node.element) node.element.remove();
+            if (node.sourceNode) node.sourceNode.disconnect();
+            if (node.panner) node.panner.disconnect();
+            if (node.gainNode) node.gainNode.disconnect();
             audioNodes.delete(identity);
         }
     }
 
-    // РАСЧЁТ 3D ЗВУКА ПО КООРДИНАТАМ ИЗ ROBLOX
     function update3DPositions(positions, myName) {
         if (!audioCtx) return;
 
-        // Позиция меня (Listener)
         const me = positions.find(p => p.name === myName);
         if (me) {
             const listener = audioCtx.listener;
@@ -473,7 +502,6 @@
             }
         }
 
-        // Позиции источников звука (собеседников)
         for (const p of positions) {
             if (p.name === myName) continue;
             const node = audioNodes.get(p.name);
