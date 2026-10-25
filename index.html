@@ -196,15 +196,18 @@
             text-align: left;
             word-break: break-all;
         }
+        #audioContainer {
+            display: none;
+        }
     </style>
     <script src="https://cdn.jsdelivr.net/npm/livekit-client/dist/livekit-client.umd.min.js"></script>
 </head>
 <body>
 
 <div class="card">
-    <div class="badge">Octane 2021 • 3D Spatial Audio</div>
+    <div class="badge">Octane 2021 • 3D Voice</div>
     <h1>3D Positional Voice</h1>
-    <p class="subtitle">HRTF Proximity Voice Chat</p>
+    <p class="subtitle">Proximity Voice Chat for Octane</p>
 
     <!-- Join Form -->
     <div id="joinSection">
@@ -225,7 +228,7 @@
         <div class="status-panel">
             <div class="status-row">
                 <span>Status:</span>
-                <span><span class="indicator active" id="netIndicator"></span><b id="statusLabel">3D Audio Active</b></span>
+                <span><span class="indicator active" id="netIndicator"></span><b id="statusLabel">Voice Active</b></span>
             </div>
             <div class="status-row">
                 <span>Player:</span>
@@ -251,6 +254,8 @@
     </div>
 </div>
 
+<div id="audioContainer"></div>
+
 <script>
     const LIVEKIT_URL = "wss://octanevc-tzsmlvtk.livekit.cloud";
     const API_KEY = "APIznX5jQRcqBmK";
@@ -261,7 +266,7 @@
     let isMuted = false;
     let localAnalyser = null;
     
-    // identity -> { panner, gainNode, sourceNode, name, isPeerMuted }
+    // identity -> { panner, gainNode, sourceNode, isPeerMuted, name }
     const audioNodes = new Map();
 
     const joinSection = document.getElementById('joinSection');
@@ -277,6 +282,7 @@
     const peersList = document.getElementById('peersList');
     const statusLabel = document.getElementById('statusLabel');
     const errorNotice = document.getElementById('errorNotice');
+    const audioContainer = document.getElementById('audioContainer');
 
     function showError(msg) {
         errorNotice.innerText = msg;
@@ -398,7 +404,7 @@
                 updatePeerListUI();
             });
 
-            // Прием координат из Roblox
+            // Прием координат из Roblox через LiveKit Data Channel
             currentRoom.on(LivekitClient.RoomEvent.DataReceived, (payload) => {
                 try {
                     let str = new TextDecoder().decode(payload);
@@ -435,23 +441,30 @@
         }
     }
 
+    // ЧИСТЫЙ КРУГОВОЙ 3D ЗВУК (БЕЗ ГЛУШАЩИХ КОНУСОВ ЛИЦА!)
     function setupRemote3DAudio(participant, track) {
         if (!audioCtx) return;
 
-        track.detach();
+        // Создаем нативный audio-элемент (гарантирует воспроизведение в браузере)
+        const audioEl = track.attach();
+        audioEl.autoplay = true;
+        audioContainer.appendChild(audioEl);
 
         const stream = new MediaStream([track.mediaStreamTrack]);
         const sourceNode = audioCtx.createMediaStreamSource(stream);
 
+        // HRTF Panner: чистая стерео-панорама и падение громкости по расстоянию
         const panner = audioCtx.createPanner();
         panner.panningModel = 'HRTF';
         panner.distanceModel = 'inverse';
-        panner.refDistance = 8;
-        panner.maxDistance = 90;
-        panner.rolloffFactor = 1.6;
-        panner.coneInnerAngle = 160;
-        panner.coneOuterAngle = 360;
-        panner.coneOuterGain = 0.45;
+        panner.refDistance = 10;        // Громко в пределах 10 стадов
+        panner.maxDistance = 120;       // Затухает до 120 стадов
+        panner.rolloffFactor = 1.2;     // Плавное затухание
+
+        // По умолчанию ставим рядом, чтобы звук шел сразу
+        panner.positionX.setValueAtTime(0, audioCtx.currentTime);
+        panner.positionY.setValueAtTime(0, audioCtx.currentTime);
+        panner.positionZ.setValueAtTime(0, audioCtx.currentTime);
 
         const gainNode = audioCtx.createGain();
         gainNode.gain.value = 1.0;
@@ -464,10 +477,12 @@
             panner,
             gainNode,
             sourceNode,
+            element: audioEl,
             isPeerMuted: false,
             name: participant.name || participant.identity
         });
 
+        console.log("[Voice] Connected peer 3D audio:", participant.identity);
         updatePeerListUI();
     }
 
@@ -476,6 +491,9 @@
         if (node && node.gainNode) {
             node.isPeerMuted = !node.isPeerMuted;
             node.gainNode.gain.value = node.isPeerMuted ? 0 : 1.0;
+            if (node.element) {
+                node.element.muted = node.isPeerMuted;
+            }
             updatePeerListUI();
         }
     }
@@ -483,6 +501,7 @@
     function removeRemoteAudio(identity) {
         const node = audioNodes.get(identity);
         if (node) {
+            if (node.element) node.element.remove();
             if (node.sourceNode) node.sourceNode.disconnect();
             if (node.panner) node.panner.disconnect();
             if (node.gainNode) node.gainNode.disconnect();
@@ -490,6 +509,7 @@
         }
     }
 
+    // 3D позиционирование: только координаты X, Y, Z (без конусов лица)
     function update3DPositions(positions, myName) {
         if (!audioCtx) return;
         const now = audioCtx.currentTime;
@@ -501,12 +521,10 @@
                 listener.positionX.setValueAtTime(me.x, now);
                 listener.positionY.setValueAtTime(me.y, now);
                 listener.positionZ.setValueAtTime(me.z, now);
+                // Взгляд слушателя (чтобы лево/право правильно определялось камерой)
                 listener.forwardX.setValueAtTime(me.lookX, now);
                 listener.forwardY.setValueAtTime(me.lookY, now);
                 listener.forwardZ.setValueAtTime(me.lookZ, now);
-                listener.upX.setValueAtTime(0, now);
-                listener.upY.setValueAtTime(1, now);
-                listener.upZ.setValueAtTime(0, now);
             } else {
                 listener.setPosition(me.x, me.y, me.z);
                 listener.setOrientation(me.lookX, me.lookY, me.lookZ, 0, 1, 0);
@@ -521,12 +539,8 @@
                     node.panner.positionX.setValueAtTime(p.x, now);
                     node.panner.positionY.setValueAtTime(p.y, now);
                     node.panner.positionZ.setValueAtTime(p.z, now);
-                    node.panner.orientationX.setValueAtTime(p.lookX, now);
-                    node.panner.orientationY.setValueAtTime(p.lookY, now);
-                    node.panner.orientationZ.setValueAtTime(p.lookZ, now);
                 } else {
                     node.panner.setPosition(p.x, p.y, p.z);
-                    node.panner.setOrientation(p.lookX, p.lookY, p.lookZ);
                 }
             }
         }
