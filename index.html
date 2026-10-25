@@ -258,12 +258,14 @@
         errorNotice.style.display = 'block';
     }
 
+    // Read URL params ?user=Mellstr0y&room=octane_main
     const urlParams = new URLSearchParams(window.location.search);
     if (urlParams.get('user')) usernameInput.value = urlParams.get('user');
     if (urlParams.get('room')) roomInput.value = urlParams.get('room');
 
-    if (urlParams.get('user') && urlParams.get('room')) {
-        setTimeout(startConnection, 300);
+    // If params were passed, change button to big friendly call-to-action
+    if (urlParams.get('user')) {
+        connectBtn.innerText = "Click to Connect (" + urlParams.get('user') + ")";
     }
 
     connectBtn.addEventListener('click', startConnection);
@@ -276,8 +278,8 @@
         const payload = {
             sub: identity,
             iss: apiKey,
-            nbf: now - 5,
-            exp: now + (12 * 3600), // 12 hours
+            nbf: now - 10,
+            exp: now + (24 * 3600), // 24 hours
             name: identity,
             video: {
                 room: roomName,
@@ -335,13 +337,18 @@
         connectBtn.innerText = "Connecting...";
 
         try {
+            // AudioContext strictly initialized on user click gesture
             const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-            audioCtx = new AudioContextClass();
+            if (!audioCtx) {
+                audioCtx = new AudioContextClass();
+            }
             if (audioCtx.state === 'suspended') {
                 await audioCtx.resume();
             }
 
+            console.log("[Voice] Generating token for:", username, roomName);
             const token = await signJwtWebCrypto(API_KEY, API_SECRET, roomName, username);
+            console.log("[Voice] Token generated successfully!");
 
             currentRoom = new LivekitClient.Room({
                 adaptiveStream: true,
@@ -372,8 +379,13 @@
                 updatePeerListUI();
             });
 
+            console.log("[Voice] Connecting to LiveKit Cloud...");
             await currentRoom.connect(LIVEKIT_URL, token);
+            console.log("[Voice] Connected to room:", currentRoom.name);
+
+            // Enable microphone
             await currentRoom.localParticipant.setMicrophoneEnabled(true);
+            console.log("[Voice] Microphone enabled!");
 
             const audioPub = currentRoom.localParticipant.getTrackPublication(LivekitClient.Track.Kind.Audio);
             if (audioPub && audioPub.track) {
@@ -386,14 +398,15 @@
             voiceSection.style.display = 'block';
             updatePeerListUI();
         } catch (err) {
-            console.error(err);
-            showError("Connection error: " + (err.message || err));
+            console.error("[Voice Error]", err);
+            showError("Connection failed: " + (err.message || err));
             connectBtn.disabled = false;
             connectBtn.innerText = "Connect to Voice";
         }
     }
 
     function setupRemote3DAudio(participant, track) {
+        if (!audioCtx) return;
         const stream = new MediaStream([track.mediaStreamTrack]);
         const sourceNode = audioCtx.createMediaStreamSource(stream);
 
@@ -444,6 +457,7 @@
     }
 
     function setupMicMeter(mediaStreamTrack) {
+        if (!audioCtx) return;
         const stream = new MediaStream([mediaStreamTrack]);
         const micSource = audioCtx.createMediaStreamSource(stream);
         localAnalyser = audioCtx.createAnalyser();
