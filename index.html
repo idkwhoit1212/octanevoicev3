@@ -228,7 +228,7 @@
         <div class="status-panel">
             <div class="status-row">
                 <span>Status:</span>
-                <span><span class="indicator active" id="netIndicator"></span><b id="statusLabel">Voice Active</b></span>
+                <span><span class="indicator active" id="netIndicator"></span><b id="statusLabel">3D Voice Connected</b></span>
             </div>
             <div class="status-row">
                 <span>Player:</span>
@@ -404,7 +404,7 @@
                 updatePeerListUI();
             });
 
-            // Прием координат из Roblox через LiveKit Data Channel
+            // Обработка данных от Roblox сервера
             currentRoom.on(LivekitClient.RoomEvent.DataReceived, (payload) => {
                 try {
                     let str = new TextDecoder().decode(payload);
@@ -414,8 +414,12 @@
                     } catch (e) {
                         data = JSON.parse(atob(str));
                     }
-                    if (data && data.type === "positions") {
-                        update3DPositions(data.positions, username);
+                    if (data) {
+                        if (data.type === "positions") {
+                            update3DPositions(data.positions, username);
+                        } else if (data.type === "toggle_mute" && data.target === username) {
+                            toggleMute();
+                        }
                     }
                 } catch (err) {}
             });
@@ -425,7 +429,7 @@
 
             const audioPub = currentRoom.localParticipant.getTrackPublication(LivekitClient.Track.Kind.Audio);
             if (audioPub && audioPub.track) {
-                setupMicMeter(audioPub.track.mediaStreamTrack);
+                setupMicMeter(audioPub.track.mediaStreamTrack, username);
             }
 
             playerLabel.innerText = username;
@@ -441,30 +445,26 @@
         }
     }
 
-    // ЧИСТЫЙ КРУГОВОЙ 3D ЗВУК (БЕЗ ГЛУШАЩИХ КОНУСОВ ЛИЦА!)
+    // НАСТОЯЩИЙ 3D SPATIAL AUDIO ВЫВОД (БЕЗ 2D ПЕРЕБИВАНИЯ)
     function setupRemote3DAudio(participant, track) {
         if (!audioCtx) return;
 
-        // Создаем нативный audio-элемент (гарантирует воспроизведение в браузере)
+        // ВАЖНО: Мы создаем audioEl, но ГЛУШИМ ЕГО (muted=true),
+        // чтобы браузер НЕ играл плоский 2D стерео звук!
         const audioEl = track.attach();
-        audioEl.autoplay = true;
+        audioEl.muted = true; // ГЛУШИМ 2D ВЫВОД!
         audioContainer.appendChild(audioEl);
 
+        // Весь звук идет ИСКЛЮЧИТЕЛЬНО через 3D PannerNode!
         const stream = new MediaStream([track.mediaStreamTrack]);
         const sourceNode = audioCtx.createMediaStreamSource(stream);
 
-        // HRTF Panner: чистая стерео-панорама и падение громкости по расстоянию
         const panner = audioCtx.createPanner();
         panner.panningModel = 'HRTF';
         panner.distanceModel = 'inverse';
-        panner.refDistance = 10;        // Громко в пределах 10 стадов
-        panner.maxDistance = 120;       // Затухает до 120 стадов
-        panner.rolloffFactor = 1.2;     // Плавное затухание
-
-        // По умолчанию ставим рядом, чтобы звук шел сразу
-        panner.positionX.setValueAtTime(0, audioCtx.currentTime);
-        panner.positionY.setValueAtTime(0, audioCtx.currentTime);
-        panner.positionZ.setValueAtTime(0, audioCtx.currentTime);
+        panner.refDistance = 8;        // Максимальная громкость до 8 стадов
+        panner.maxDistance = 80;       // Дистанция слышимости до 80 стадов
+        panner.rolloffFactor = 1.8;     // Отчетливое затухание при отдалении
 
         const gainNode = audioCtx.createGain();
         gainNode.gain.value = 1.0;
@@ -482,7 +482,7 @@
             name: participant.name || participant.identity
         });
 
-        console.log("[Voice] Connected peer 3D audio:", participant.identity);
+        console.log("[3D Audio] Configured Panner for:", participant.identity);
         updatePeerListUI();
     }
 
@@ -491,9 +491,6 @@
         if (node && node.gainNode) {
             node.isPeerMuted = !node.isPeerMuted;
             node.gainNode.gain.value = node.isPeerMuted ? 0 : 1.0;
-            if (node.element) {
-                node.element.muted = node.isPeerMuted;
-            }
             updatePeerListUI();
         }
     }
@@ -509,7 +506,7 @@
         }
     }
 
-    // 3D позиционирование: только координаты X, Y, Z (без конусов лица)
+    // 3D позиционирование: точные координаты из Roblox
     function update3DPositions(positions, myName) {
         if (!audioCtx) return;
         const now = audioCtx.currentTime;
@@ -521,10 +518,12 @@
                 listener.positionX.setValueAtTime(me.x, now);
                 listener.positionY.setValueAtTime(me.y, now);
                 listener.positionZ.setValueAtTime(me.z, now);
-                // Взгляд слушателя (чтобы лево/право правильно определялось камерой)
                 listener.forwardX.setValueAtTime(me.lookX, now);
                 listener.forwardY.setValueAtTime(me.lookY, now);
                 listener.forwardZ.setValueAtTime(me.lookZ, now);
+                listener.upX.setValueAtTime(0, now);
+                listener.upY.setValueAtTime(1, now);
+                listener.upZ.setValueAtTime(0, now);
             } else {
                 listener.setPosition(me.x, me.y, me.z);
                 listener.setOrientation(me.lookX, me.lookY, me.lookZ, 0, 1, 0);
@@ -558,9 +557,27 @@
             muteBtn.classList.remove('muted');
             muteBtn.innerText = 'Microphone: ON';
         }
+
+        // Шлем статус мьюта в комнату
+        broadcastVolume(playerLabel.innerText, 0, isMuted);
     }
 
-    function setupMicMeter(mediaStreamTrack) {
+    function broadcastVolume(name, vol, muted) {
+        if (!currentRoom || currentRoom.state !== 'connected') return;
+        try {
+            const payload = JSON.stringify({
+                type: "user_volume",
+                name: name,
+                volume: vol,
+                isMuted: muted
+            });
+            const data = new TextEncoder().encode(payload);
+            currentRoom.localParticipant.publishData(data, { reliable: false });
+        } catch (e) {}
+    }
+
+    // Замер реальной громкости микрофона и отправка точных процентов (0, 20, 40, 60, 80, 100)
+    function setupMicMeter(mediaStreamTrack, myUsername) {
         if (!audioCtx) return;
         const stream = new MediaStream([mediaStreamTrack]);
         const micSource = audioCtx.createMediaStreamSource(stream);
@@ -569,13 +586,29 @@
         micSource.connect(localAnalyser);
 
         const buffer = new Uint8Array(localAnalyser.frequencyBinCount);
+        let lastSendTime = 0;
+
         function checkVolume() {
             localAnalyser.getByteFrequencyData(buffer);
             let sum = 0;
             for (let i = 0; i < buffer.length; i++) sum += buffer[i];
             const avg = sum / buffer.length;
-            const vol = isMuted ? 0 : Math.min(100, Math.round((avg / 128) * 100));
+            
+            // Если звук ниже порога шума (avg < 5) — считаем 0%
+            let vol = 0;
+            if (!isMuted && avg >= 5) {
+                vol = Math.min(100, Math.round((avg / 80) * 100));
+            }
+
             micMeter.style.width = vol + '%';
+
+            // Отправляем реальную громкость в комнату каждые 100 мс
+            const now = Date.now();
+            if (now - lastSendTime >= 100) {
+                lastSendTime = now;
+                broadcastVolume(myUsername, vol, isMuted);
+            }
+
             requestAnimationFrame(checkVolume);
         }
         requestAnimationFrame(checkVolume);
