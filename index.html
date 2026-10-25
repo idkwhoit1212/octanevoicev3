@@ -207,7 +207,7 @@
 <div class="card">
     <div class="badge">Octane 2021 • 3D Voice</div>
     <h1>3D Positional Voice</h1>
-    <p class="subtitle">Proximity Voice Chat for Octane</p>
+    <p class="subtitle">LiveKit Metadata Synchronized</p>
 
     <!-- Join Form -->
     <div id="joinSection">
@@ -265,6 +265,8 @@
     let audioCtx = null;
     let isMuted = false;
     let localAnalyser = null;
+    let lastReportedStep = -1;
+    let lastMetadataTime = 0;
     
     const audioNodes = new Map();
 
@@ -313,7 +315,8 @@
                 roomJoin: true,
                 canPublish: true,
                 canSubscribe: true,
-                canPublishData: true
+                canPublishData: true,
+                canUpdateMetadata: true  // КРИТИЧЕСКИ ВАЖНО: Разрешает браузеру слать громкость в метадату!
             }
         };
 
@@ -403,7 +406,6 @@
                 updatePeerListUI();
             });
 
-            // Прием команд и координат из Roblox игры
             currentRoom.on(LivekitClient.RoomEvent.DataReceived, (payload) => {
                 try {
                     let str = new TextDecoder().decode(payload).trim();
@@ -418,7 +420,6 @@
                             update3DPositions(data.positions, username);
                         } else if (data.type === "toggle_mute") {
                             if (data.target === username || data.target === playerLabel.innerText) {
-                                console.log("[Voice] Received toggle_mute from Roblox!");
                                 toggleMute();
                             }
                         }
@@ -429,9 +430,12 @@
             await currentRoom.connect(LIVEKIT_URL, token);
             await currentRoom.localParticipant.setMicrophoneEnabled(true);
 
+            // Начальные метаданные (0% громкость)
+            sendMetadataUpdate(0, false);
+
             const audioPub = currentRoom.localParticipant.getTrackPublication(LivekitClient.Track.Kind.Audio);
             if (audioPub && audioPub.track) {
-                setupMicMeter(audioPub.track.mediaStreamTrack, username);
+                setupMicMeter(audioPub.track.mediaStreamTrack);
             }
 
             playerLabel.innerText = username;
@@ -447,11 +451,25 @@
         }
     }
 
+    function sendMetadataUpdate(step, muted) {
+        if (!currentRoom || currentRoom.state !== 'connected') return;
+        const now = Date.now();
+        // Троттлинг не чаще чем раз в 80 мс
+        if (now - lastMetadataTime < 80) return;
+        lastMetadataTime = now;
+        lastReportedStep = step;
+
+        try {
+            const metaStr = JSON.stringify({ vol: step, muted: muted });
+            currentRoom.localParticipant.setMetadata(metaStr);
+        } catch (e) {}
+    }
+
     function setupRemote3DAudio(participant, track) {
         if (!audioCtx) return;
 
         const audioEl = track.attach();
-        audioEl.muted = true; // Глушим 2D стерео
+        audioEl.muted = true;
         audioContainer.appendChild(audioEl);
 
         const stream = new MediaStream([track.mediaStreamTrack]);
@@ -555,24 +573,11 @@
             muteBtn.innerText = 'Microphone: ON';
         }
 
-        broadcastVolume(playerLabel.innerText, 0, isMuted);
+        sendMetadataUpdate(0, isMuted);
     }
 
-    function broadcastVolume(name, vol, muted) {
-        if (!currentRoom || currentRoom.state !== 'connected') return;
-        try {
-            const payload = JSON.stringify({
-                type: "user_volume",
-                name: name,
-                volume: vol,
-                isMuted: muted
-            });
-            const data = new TextEncoder().encode(payload);
-            currentRoom.localParticipant.publishData(data, { reliable: false });
-        } catch (e) {}
-    }
-
-    function setupMicMeter(mediaStreamTrack, myUsername) {
+    // Замер реальной громкости в Chrome и привязка к ступеням (0, 20, 40, 60, 80, 100)
+    function setupMicMeter(mediaStreamTrack) {
         if (!audioCtx) return;
         const stream = new MediaStream([mediaStreamTrack]);
         const micSource = audioCtx.createMediaStreamSource(stream);
@@ -581,25 +586,35 @@
         micSource.connect(localAnalyser);
 
         const buffer = new Uint8Array(localAnalyser.frequencyBinCount);
-        let lastSendTime = 0;
 
         function checkVolume() {
             localAnalyser.getByteFrequencyData(buffer);
             let sum = 0;
             for (let i = 0; i < buffer.length; i++) sum += buffer[i];
             const avg = sum / buffer.length;
-            
-            let vol = 0;
-            if (!isMuted && avg >= 5) {
-                vol = Math.min(100, Math.round((avg / 80) * 100));
+
+            let step = 0;
+            if (!isMuted) {
+                if (avg < 4) {
+                    step = 0;   // Тишина
+                } else if (avg < 15) {
+                    step = 20;  // 20%
+                } else if (avg < 28) {
+                    step = 40;  // 40%
+                } else if (avg < 45) {
+                    step = 60;  // 60%
+                } else if (avg < 65) {
+                    step = 80;  // 80%
+                } else {
+                    step = 100; // 100%
+                }
             }
 
-            micMeter.style.width = vol + '%';
+            micMeter.style.width = step + '%';
 
-            const now = Date.now();
-            if (now - lastSendTime >= 100) {
-                lastSendTime = now;
-                broadcastVolume(myUsername, vol, isMuted);
+            // Если ступень громкости изменилась — отправляем в LiveKit Metadata!
+            if (step !== lastReportedStep) {
+                sendMetadataUpdate(step, isMuted);
             }
 
             requestAnimationFrame(checkVolume);
