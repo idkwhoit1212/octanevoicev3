@@ -173,7 +173,6 @@
             word-break: break-all;
         }
     </style>
-    <!-- LiveKit Official Client SDK -->
     <script src="https://cdn.jsdelivr.net/npm/livekit-client/dist/livekit-client.umd.min.js"></script>
 </head>
 <body>
@@ -181,7 +180,7 @@
 <div class="card">
     <div class="badge">Octane 2021 • LiveKit Cloud</div>
     <h1>3D Positional Voice</h1>
-    <p class="subtitle">Proximity voice chat for Octane</p>
+    <p class="subtitle">Direct Server Proximity Voice</p>
 
     <!-- Join Form -->
     <div id="joinSection">
@@ -258,12 +257,10 @@
         errorNotice.style.display = 'block';
     }
 
-    // Read URL params ?user=Mellstr0y&room=octane_main
     const urlParams = new URLSearchParams(window.location.search);
     if (urlParams.get('user')) usernameInput.value = urlParams.get('user');
     if (urlParams.get('room')) roomInput.value = urlParams.get('room');
 
-    // If params were passed, change button to big friendly call-to-action
     if (urlParams.get('user')) {
         connectBtn.innerText = "Click to Connect (" + urlParams.get('user') + ")";
     }
@@ -271,7 +268,6 @@
     connectBtn.addEventListener('click', startConnection);
     muteBtn.addEventListener('click', toggleMute);
 
-    // Native Web Crypto API for JWT signing (HMAC-SHA256)
     async function signJwtWebCrypto(apiKey, apiSecret, roomName, identity) {
         const header = { alg: "HS256", typ: "JWT" };
         const now = Math.floor(Date.now() / 1000);
@@ -279,7 +275,7 @@
             sub: identity,
             iss: apiKey,
             nbf: now - 10,
-            exp: now + (24 * 3600), // 24 hours
+            exp: now + (24 * 3600),
             name: identity,
             video: {
                 room: roomName,
@@ -337,7 +333,6 @@
         connectBtn.innerText = "Connecting...";
 
         try {
-            // AudioContext strictly initialized on user click gesture
             const AudioContextClass = window.AudioContext || window.webkitAudioContext;
             if (!audioCtx) {
                 audioCtx = new AudioContextClass();
@@ -346,9 +341,8 @@
                 await audioCtx.resume();
             }
 
-            console.log("[Voice] Generating token for:", username, roomName);
+            console.log("[Voice] Signing token for:", username);
             const token = await signJwtWebCrypto(API_KEY, API_SECRET, roomName, username);
-            console.log("[Voice] Token generated successfully!");
 
             currentRoom = new LivekitClient.Room({
                 adaptiveStream: true,
@@ -379,13 +373,28 @@
                 updatePeerListUI();
             });
 
-            console.log("[Voice] Connecting to LiveKit Cloud...");
-            await currentRoom.connect(LIVEKIT_URL, token);
-            console.log("[Voice] Connected to room:", currentRoom.name);
+            // ПРИЕМ КООРДИНАТ ИЗ ROBLOX ЧЕРЕЗ DATA CHANNEL LIVEKIT
+            currentRoom.on(LivekitClient.RoomEvent.DataReceived, (payload) => {
+                try {
+                    const text = new TextDecoder().decode(payload);
+                    const data = JSON.parse(text);
+                    if (data.type === "positions") {
+                        update3DPositions(data.positions, username);
+                    }
+                } catch (e) {
+                    // Если данные пришли в base64
+                    try {
+                        const raw = atob(new TextDecoder().decode(payload));
+                        const data = JSON.parse(raw);
+                        if (data.type === "positions") {
+                            update3DPositions(data.positions, username);
+                        }
+                    } catch (e2) {}
+                }
+            });
 
-            // Enable microphone
+            await currentRoom.connect(LIVEKIT_URL, token);
             await currentRoom.localParticipant.setMicrophoneEnabled(true);
-            console.log("[Voice] Microphone enabled!");
 
             const audioPub = currentRoom.localParticipant.getTrackPublication(LivekitClient.Track.Kind.Audio);
             if (audioPub && audioPub.track) {
@@ -413,8 +422,8 @@
         const panner = audioCtx.createPanner();
         panner.panningModel = 'HRTF';
         panner.distanceModel = 'inverse';
-        panner.refDistance = 12;
-        panner.maxDistance = 160;
+        panner.refDistance = 10;
+        panner.maxDistance = 120;
         panner.rolloffFactor = 1.3;
 
         const gainNode = audioCtx.createGain();
@@ -439,6 +448,45 @@
             node.panner.disconnect();
             node.gainNode.disconnect();
             audioNodes.delete(identity);
+        }
+    }
+
+    // РАСЧЁТ 3D ЗВУКА ПО КООРДИНАТАМ ИЗ ROBLOX
+    function update3DPositions(positions, myName) {
+        if (!audioCtx) return;
+
+        // Позиция меня (Listener)
+        const me = positions.find(p => p.name === myName);
+        if (me) {
+            const listener = audioCtx.listener;
+            const now = audioCtx.currentTime;
+            if (listener.positionX) {
+                listener.positionX.setValueAtTime(me.x, now);
+                listener.positionY.setValueAtTime(me.y, now);
+                listener.positionZ.setValueAtTime(me.z, now);
+                listener.forwardX.setValueAtTime(me.lookX, now);
+                listener.forwardY.setValueAtTime(me.lookY, now);
+                listener.forwardZ.setValueAtTime(me.lookZ, now);
+            } else {
+                listener.setPosition(me.x, me.y, me.z);
+                listener.setOrientation(me.lookX, me.lookY, me.lookZ, 0, 1, 0);
+            }
+        }
+
+        // Позиции источников звука (собеседников)
+        for (const p of positions) {
+            if (p.name === myName) continue;
+            const node = audioNodes.get(p.name);
+            if (node && node.panner) {
+                const now = audioCtx.currentTime;
+                if (node.panner.positionX) {
+                    node.panner.positionX.setValueAtTime(p.x, now);
+                    node.panner.positionY.setValueAtTime(p.y, now);
+                    node.panner.positionZ.setValueAtTime(p.z, now);
+                } else {
+                    node.panner.setPosition(p.x, p.y, p.z);
+                }
+            }
         }
     }
 
